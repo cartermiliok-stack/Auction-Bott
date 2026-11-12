@@ -35,4 +35,12 @@ Configure the same environment variables in your hosting provider's secret setti
 - `/auctions`, `/mybids`, `/auction_help` — view current auctions, your bids, and help.
 - `/end_auction` and `/cancel_auction` — host or Manage Server controls.
 
-The bot supports custom bidder names, minimum increments, anti-snipe extensions, outbid DMs, JSON persistence, and winner announcements.
+The bot supports custom bidder names, minimum increments, anti-snipe extensions, JSON persistence, and winner announcements. An auction can hold any number of items; when they don't all fit on the post, a **View all items** button opens a paged list. The post refreshes as bids come in and turns orange once the auction enters its final quarter.
+
+## Direct messages
+
+The bot sends these DMs on a best-effort basis. Anyone who has turned off DMs from server members simply won't receive them, and nothing else is affected.
+
+- **Outbid:** when someone beats your bid you get the item, the new top bid, and the minimum needed to retake the lead. It never says who outbid you.
+- **Raised:** when you raise your own top bid you get the previous and new amounts.
+- **Time checks:** everyone who has bid gets a DM when 50% and again when 75% of an auction's running time has passed (a 100-minute auction sends them at 50 and 25 minutes left), showing where their bids stand. These marks are measured against the auction's original length, so anti-snipe extensions don't move them. Auctions that were already running before this feature was added don't send them.
