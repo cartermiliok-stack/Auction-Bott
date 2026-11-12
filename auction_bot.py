@@ -1,4 +1,4 @@
-"""Persistent mock auction bot for Discord (discord.py 2.4+, Python 3.10+).
+"""Mock auction bot for Discord (discord.py 2.4+, Python 3.10+).
 
 Direct messages (best effort: people with DMs closed simply don't get them)
   * Outbid: when someone beats your bid you get a DM with the new top bid. It never says who.
@@ -9,12 +9,24 @@ Direct messages (best effort: people with DMs closed simply don't get them)
 An auction can hold any number of items. When they don't all fit on the post, a
 "View all items" button opens a paged list. The post turns orange once the auction
 enters its final quarter.
+
+Starting bids and currency
+  * /create_auction starting_bids:"50, 100, 25" gives every item its own opening bid, in the
+    same order as the items. A single number applies to all of them.
+  * currency:"gold" (or $, 🪙 ...) names the money. /set_currency changes it on a running
+    auction, and the DEFAULT_CURRENCY setting picks one when none is given.
+
+Memory
+  * Auctions are not carried over between runs: a restart starts clean, and auction numbers
+    always start again from the lowest free one. Set KEEP_AUCTIONS=1 to save running auctions
+    to AUCTION_DATA_FILE and resume them after a restart instead.
 """
 import asyncio
 import json
 import logging
 import os
 import re
+import secrets
 import time
 from decimal import Decimal
 from itertools import islice
@@ -34,6 +46,8 @@ except ImportError:
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("auctionbot")
 DATA_FILE = Path(os.getenv("AUCTION_DATA_FILE", "data/auctions.json"))
+KEEP_AUCTIONS = os.getenv("KEEP_AUCTIONS", "").strip().lower() in ("1", "true", "yes", "on")
+MAX_CURRENCY = 16  # characters in a currency name
 MAX_BID = 10**12
 MAX_DURATION = 14 * 86400
 SNIPE_SECONDS = 30
@@ -82,12 +96,12 @@ def duration(value: str) -> Optional[int]:
     return seconds if 10 <= seconds <= MAX_DURATION else None
 
 
-def amount(value: str) -> Optional[int]:
+def amount(value: str, minimum: int = 1) -> Optional[int]:
     match = re.fullmatch(r"(\d+(?:\.\d+)?)([km]?)", re.sub(r"[\s,_]", "", value.lower()))
     if not match:
         return None
     number = Decimal(match[1]) * {"": 1, "k": 1000, "m": 1000000}[match[2]]
-    return int(number) if number == number.to_integral_value() and 1 <= number <= MAX_BID else None
+    return int(number) if number == number.to_integral_value() and minimum <= number <= MAX_BID else None
 
 
 def fmt(n: int) -> str:
@@ -96,6 +110,43 @@ def fmt(n: int) -> str:
 
 def plural(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def money(a: dict, n: int) -> str:
+    """1234 -> '1,234', '$1,234' or '1,234 gold', depending on the auction's currency name."""
+    cur = a.get("currency")
+    if not cur:
+        return fmt(n)
+    if len(cur) <= 2 and not cur.isalnum():  # $, €, 🪙 ... go in front
+        return f"{cur}{fmt(n)}"
+    return f"{fmt(n)} {cur}"
+
+
+def clean_currency(value: str) -> Optional[str]:
+    """A currency name that is safe to show (it can't ping anyone), or None if it's empty."""
+    return discord.utils.escape_mentions(clean(value, MAX_CURRENCY)) or None
+
+
+DEFAULT_CURRENCY = clean_currency(os.getenv("DEFAULT_CURRENCY", ""))  # used when a host doesn't pick one
+
+
+def starting_bids_for(text: Optional[str], count: int) -> tuple[list[int], Optional[str]]:
+    """'50, 100, 25' -> one opening bid per item. A single number applies to every item, and
+    leaving it empty means the lowest allowed bid is 1. Returns (bids, error message)."""
+    parts = [p.strip() for p in (text or "").split(",") if p.strip()]
+    if not parts:
+        return [0] * count, None
+    bids = [amount(p, minimum=0) for p in parts]
+    if None in bids:
+        return [], "I couldn't read the starting bids. Use whole numbers separated by commas, like `50, 100, 25`."
+    if len(bids) == 1:
+        bids *= count
+    if len(bids) != count:
+        return [], (
+            f"You listed {plural(count, 'item')} but {plural(len(bids), 'starting bid')}. "
+            "Give one starting bid per item, or a single number for all of them."
+        )
+    return bids, None
 
 
 def tag(a: dict) -> str:
@@ -112,9 +163,16 @@ def jump_url(a: dict) -> str:
     return f"https://discord.com/channels/{a['guild_id']}/{a['channel_id']}/{a['message_id']}"
 
 
+def running(auction_id: int, nonce: str) -> Optional[dict]:
+    """The auction with this number, but only if it is still the one a button or form was made for.
+    Numbers are reused once an auction is over, so a leftover button must not reach a newer auction."""
+    a = bot.store.auctions.get(auction_id)
+    return a if a is not None and a["nonce"] == nonce else None
+
+
 def minimum_bid(a: dict, it: dict) -> int:
     """The lowest bid currently allowed on an item."""
-    floor = a["starting_bid"] if it["bidder_id"] is None else it["bid"] + a["min_increment"]
+    floor = it["start"] if it["bidder_id"] is None else it["bid"] + a["min_increment"]
     return max(1, floor)
 
 
@@ -189,34 +247,41 @@ def in_final_quarter(a: dict) -> bool:
 # ─────────────────────────── embeds ───────────────────────────
 
 
-def item_line(n: int, it: dict, state: str) -> str:
+def item_line(a: dict, n: int, it: dict, state: str, show_start: bool = False) -> str:
     name = safe(it["name"])
     if it["bidder_id"] is None:
         status = {"open": "no bids yet", "ended": "unsold", "cancelled": "no bids"}[state]
-        return f"**{n}.** {name} · *{status}*"
+        opens = f" · opens at **{money(a, max(1, it['start']))}**" if show_start and state == "open" else ""
+        return f"**{n}.** {name} · *{status}*{opens}"
     word = {"open": "", "ended": "sold for ", "cancelled": "last bid "}[state]
-    return f"**{n}.** {name} · {word}**{fmt(it['bid'])}** · {safe(it['bidder_name'])}"
+    return f"**{n}.** {name} · {word}**{money(a, it['bid'])}** · {safe(it['bidder_name'])}"
 
 
 def layout(a: dict, state: str = "open") -> tuple[list[tuple[str, str]], list[str], int]:
     """The post's stat fields, its item fields, and how many items didn't fit."""
     ts = int(a["ends_at"])
     sold = [it for it in a["items"] if it["bidder_id"] is not None]
+    starts = [max(1, it["start"]) for it in a["items"]]
+    varied = min(starts) != max(starts)  # the items have different opening bids
     if state == "open":
+        if varied:
+            opening = ("Opening bids", f"{money(a, min(starts))} to {money(a, max(starts))}")
+        else:
+            opening = ("Opening bid", money(a, starts[0]))
         stats = [
             ("Ends", f"<t:{ts}:R>\n<t:{ts}:f>"),
-            ("Opening bid", fmt(max(1, a["starting_bid"]))),
-            ("Minimum raise", fmt(a["min_increment"])),
+            opening,
+            ("Minimum raise", money(a, a["min_increment"])),
         ]
     elif state == "ended":
         stats = [
             ("Ended", f"<t:{ts}:f>"),
             ("Sold", f"{len(sold)} of {len(a['items'])}"),
-            ("Total", fmt(sum(it["bid"] for it in sold)) if sold else "None"),
+            ("Total", money(a, sum(it["bid"] for it in sold)) if sold else "None"),
         ]
     else:
         stats = []
-    lines = [item_line(n, it, state) for n, it in enumerate(a["items"], 1)]
+    lines = [item_line(a, n, it, state, varied) for n, it in enumerate(a["items"], 1)]
     chunks = list(islice(chunk_lines(lines, ITEM_FIELD_LIMIT), MAX_ITEM_FIELDS))
     hidden = len(lines) - sum(c.count("\n") + 1 for c in chunks)
     if hidden:
@@ -270,7 +335,7 @@ def result_pages(a: dict) -> tuple[list[discord.Embed], list[int]]:
         total += it["bid"]
         winners.add(it["bidder_id"])
         lines.append(
-            f"**{n}.** {safe(it['name'])} · **{fmt(it['bid'])}** · "
+            f"**{n}.** {safe(it['name'])} · **{money(a, it['bid'])}** · "
             f"**{safe(it['bidder_name'])}** (<@{it['bidder_id']}>)"
         )
     if unsold:
@@ -280,7 +345,7 @@ def result_pages(a: dict) -> tuple[list[discord.Embed], list[int]]:
 
     summary = f"**{sold} of {len(a['items'])} items sold**"
     if sold:
-        summary += f" · **{fmt(total)}** in total"
+        summary += f" · **{money(a, total)}** in total"
     intro = f"{label(a)} has ended. [Original post]({jump_url(a)})\n{summary}"
     pages = list(chunk_lines(lines, 3600))
     embeds = []
@@ -307,8 +372,8 @@ def outbid_embed(a: dict, it: dict) -> discord.Embed:
         description=f"Someone placed a higher bid on **{safe(it['name'])}** in {label(a)}.",
         color=ORANGE,
     )
-    embed.add_field(name="New top bid", value=fmt(it["bid"]), inline=True)
-    embed.add_field(name="To take the lead", value=f"At least {fmt(minimum_bid(a, it))}", inline=True)
+    embed.add_field(name="New top bid", value=money(a, it["bid"]), inline=True)
+    embed.add_field(name="To take the lead", value=f"At least {money(a, minimum_bid(a, it))}", inline=True)
     embed.add_field(name="Ends", value=f"<t:{int(a['ends_at'])}:R>", inline=True)
     return embed
 
@@ -324,8 +389,8 @@ def raised_embed(a: dict, it: dict, previous_bid: int) -> discord.Embed:
         ),
         color=GREEN,
     )
-    embed.add_field(name="Previous bid", value=fmt(previous_bid), inline=True)
-    embed.add_field(name="New bid", value=fmt(it["bid"]), inline=True)
+    embed.add_field(name="Previous bid", value=money(a, previous_bid), inline=True)
+    embed.add_field(name="New bid", value=money(a, it["bid"]), inline=True)
     embed.add_field(name="Bidding as", value=safe(it["bidder_name"]), inline=True)
     embed.add_field(name="Ends", value=f"<t:{int(a['ends_at'])}:R>", inline=False)
     return embed
@@ -337,7 +402,9 @@ def raised_embed(a: dict, it: dict, previous_bid: int) -> discord.Embed:
 def migrate(a: dict):
     """Fill in fields that older saves don't have."""
     a.setdefault("title", None)
-    a.setdefault("starting_bid", 0)
+    a.setdefault("currency", None)
+    a.setdefault("nonce", secrets.token_hex(4))
+    legacy_start = a.pop("starting_bid", 0)  # older saves had one opening bid for the whole auction
     a.setdefault("min_increment", 1)
     a.setdefault("anti_snipe", False)
     a.setdefault("extensions", 0)
@@ -348,33 +415,49 @@ def migrate(a: dict):
     a.setdefault("duration", None)
     a.setdefault("notified", [])
     for it in a["items"]:
+        it.setdefault("start", legacy_start)
         it.setdefault("bidders", {} if it["bidder_id"] is None else {str(it["bidder_id"]): it["bid"]})
     a.setdefault("bid_count", sum(1 for it in a["items"] if it["bidder_id"] is not None))
 
 
 class Store:
-    """JSON-backed auction state. Mount the configured data directory persistently."""
+    """Auction state. Nothing is carried over between runs unless KEEP_AUCTIONS is on, in which case
+    running auctions are saved as JSON (mount the data directory persistently when hosting)."""
 
     def __init__(self):
         self.path = DATA_FILE
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.next_id = 1
+        self.persist = KEEP_AUCTIONS
         self.auctions: dict[int, dict] = {}
+        self.reserved: set[int] = set()  # numbers claimed by auctions that are still being posted
+        if not self.persist:
+            if self.path.exists():
+                log.info("Ignoring %s: auctions are not carried over between runs (set KEEP_AUCTIONS=1 to keep them)", self.path)
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         if self.path.exists():
             try:
                 saved = json.loads(self.path.read_text(encoding="utf-8"))
-                self.next_id = int(saved.get("next_id", 1))
                 self.auctions = {int(k): v for k, v in saved.get("auctions", {}).items()}
                 for a in self.auctions.values():
                     migrate(a)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                 log.exception("Could not load auction data: %s", exc)
                 self.path.replace(self.path.with_suffix(f".corrupt-{int(time.time())}.json"))
-                self.next_id, self.auctions = 1, {}
+                self.auctions = {}
+
+    def reserve_id(self) -> int:
+        """The lowest auction number nobody is using, so numbering never depends on past auctions."""
+        n = 1
+        while n in self.auctions or n in self.reserved:
+            n += 1
+        self.reserved.add(n)
+        return n
 
     def save(self):
+        if not self.persist:
+            return
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"next_id": self.next_id, "auctions": self.auctions}, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps({"auctions": self.auctions}, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
 
@@ -479,9 +562,9 @@ class AuctionBot(discord.Client):
         for n, it in enumerate(a["items"], 1):
             for uid, best in it["bidders"].items():
                 winning = int(uid) == it["bidder_id"]
-                status = "**Winning**" if winning else f"Outbid, now **{fmt(it['bid'])}**"
+                status = "**Winning**" if winning else f"Outbid, now **{money(a, it['bid'])}**"
                 rows.setdefault(int(uid), []).append(
-                    (f"**{n}.** {safe(it['name'])} · your best {fmt(best)} · {status}", winning)
+                    (f"**{n}.** {safe(it['name'])} · your best {money(a, best)} · {status}", winning)
                 )
         if not rows:
             return
@@ -576,11 +659,11 @@ class AuctionBot(discord.Client):
         need = minimum_bid(auction, item)
         if bid < need:
             if item["bidder_id"] is None:
-                msg = f"The first bid on **{safe(item['name'])}** has to be at least **{fmt(need)}**."
+                msg = f"The first bid on **{safe(item['name'])}** has to be at least **{money(auction, need)}**."
             else:
                 msg = (
-                    f"**{safe(item['name'])}** is at **{fmt(item['bid'])}**, "
-                    f"so you need to bid at least **{fmt(need)}**."
+                    f"**{safe(item['name'])}** is at **{money(auction, item['bid'])}**, "
+                    f"so you need to bid at least **{money(auction, need)}**."
                 )
             return await reject(interaction, msg, "Bid too low")
 
@@ -614,13 +697,13 @@ class AuctionBot(discord.Client):
             "Bid placed",
         )
         confirm.add_field(name="Item", value=safe(item["name"]), inline=True)
-        confirm.add_field(name="Your bid", value=fmt(bid), inline=True)
+        confirm.add_field(name="Your bid", value=money(auction, bid), inline=True)
         confirm.add_field(name="Bidding as", value=safe(display), inline=True)
         await send_card(interaction, confirm, link_view(auction))
 
-        text = f"**{safe(display)}** bid **{fmt(bid)}** on **{safe(item['name'])}**"
+        text = f"**{safe(display)}** bid **{money(auction, bid)}** on **{safe(item['name'])}**"
         if previous_top is not None:
-            text += f" (up from {fmt(previous_bid)})"
+            text += f" (up from {money(auction, previous_bid)})"
         if extended:
             text += f"\nAnti-snipe: bidding now ends <t:{int(auction['ends_at'])}:R>."
         card = discord.Embed(description=text, color=ORANGE if extended else GOLD)
@@ -670,7 +753,7 @@ class Pager(discord.ui.View):
     """Previous / Next buttons under a private embed. `render(page)` returns
     (embed, page_count), or None when there is nothing left to show."""
 
-    def __init__(self, render: Callable[[int], Optional[tuple[discord.Embed, int]]], auction_id: Optional[int] = None):
+    def __init__(self, render: Callable[[int], Optional[tuple[discord.Embed, int]]], auction_id: Optional[int] = None, nonce: Optional[str] = None):
         super().__init__(timeout=600)
         self.render = render
         self.page = 0
@@ -685,7 +768,7 @@ class Pager(discord.ui.View):
         if auction_id is not None:
 
             async def place_bid_here(interaction: discord.Interaction):
-                await open_bid_modal(interaction, auction_id)
+                await open_bid_modal(interaction, auction_id, nonce)
 
             bid_button = discord.ui.Button(label="Place a bid", style=discord.ButtonStyle.success)
             bid_button.callback = place_bid_here
@@ -750,20 +833,20 @@ async def send_pages(interaction: discord.Interaction, title: str, pages: list[s
         await Pager(render).send(interaction)
 
 
-def items_page(auction_id: int, page: int):
+def items_page(auction_id: int, nonce: str, page: int):
     """One page of the "View all items" list (always live), or None if the auction is over."""
-    a = bot.store.auctions.get(auction_id)
+    a = running(auction_id, nonce)
     if a is None:
         return None
     total = len(a["items"])
     start = page * ITEMS_PER_PAGE
     entries = []
     for n, it in enumerate(a["items"][start : start + ITEMS_PER_PAGE], start + 1):
-        need = fmt(minimum_bid(a, it))
+        need = money(a, minimum_bid(a, it))
         if it["bidder_id"] is None:
             detail = f"No bids yet · first bid at least **{need}**"
         else:
-            detail = f"Top bid **{fmt(it['bid'])}** · {safe(it['bidder_name'])} · next bid at least **{need}**"
+            detail = f"Top bid **{money(a, it['bid'])}** · {safe(it['bidder_name'])} · next bid at least **{need}**"
         entries.append(f"**{n}. {safe(it['name'])}**\n{detail}")
     embed = discord.Embed(title=a.get("title") or f"Auction #{a['id']}", description="\n\n".join(entries), color=GOLD)
     embed.set_author(name=f"All items · {plural(total, 'item')}")
@@ -776,53 +859,53 @@ def items_page(auction_id: int, page: int):
 
 def bid_view(a: dict) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(BidButton(a["id"]))
+    view.add_item(BidButton(a["id"], a["nonce"]))
     if layout(a, "open")[2]:  # not every item fits on the post
-        view.add_item(ItemsButton(a["id"]))
+        view.add_item(ItemsButton(a["id"], a["nonce"]))
     return view
 
 
-async def open_bid_modal(interaction: discord.Interaction, auction_id: int):
-    auction = bot.store.auctions.get(auction_id)
+async def open_bid_modal(interaction: discord.Interaction, auction_id: int, nonce: str):
+    auction = running(auction_id, nonce)
     if not auction or time.time() >= auction["ends_at"]:
         return await reject(interaction, "That auction has ended.")
     await interaction.response.send_modal(BidModal(auction, interaction.user))
 
 
-class BidButton(discord.ui.DynamicItem[discord.ui.Button], template=r"auction:bid:(?P<id>[0-9]+)"):
-    def __init__(self, auction_id: int):
-        super().__init__(discord.ui.Button(label="Place a bid", style=discord.ButtonStyle.success, custom_id=f"auction:bid:{auction_id}"))
-        self.auction_id = auction_id
+class BidButton(discord.ui.DynamicItem[discord.ui.Button], template=r"auction:bid:(?P<id>[0-9]+):(?P<nonce>[0-9a-f]+)"):
+    def __init__(self, auction_id: int, nonce: str):
+        super().__init__(discord.ui.Button(label="Place a bid", style=discord.ButtonStyle.success, custom_id=f"auction:bid:{auction_id}:{nonce}"))
+        self.auction_id, self.nonce = auction_id, nonce
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
-        return cls(int(match["id"]))
+        return cls(int(match["id"]), match["nonce"])
 
     async def callback(self, interaction: discord.Interaction):
-        await open_bid_modal(interaction, self.auction_id)
+        await open_bid_modal(interaction, self.auction_id, self.nonce)
 
 
-class ItemsButton(discord.ui.DynamicItem[discord.ui.Button], template=r"auction:items:(?P<id>[0-9]+)"):
+class ItemsButton(discord.ui.DynamicItem[discord.ui.Button], template=r"auction:items:(?P<id>[0-9]+):(?P<nonce>[0-9a-f]+)"):
     """'View all items': a private, paged list. Only shown when the items don't all fit on the post."""
 
-    def __init__(self, auction_id: int):
-        super().__init__(discord.ui.Button(label="View all items", style=discord.ButtonStyle.secondary, custom_id=f"auction:items:{auction_id}"))
-        self.auction_id = auction_id
+    def __init__(self, auction_id: int, nonce: str):
+        super().__init__(discord.ui.Button(label="View all items", style=discord.ButtonStyle.secondary, custom_id=f"auction:items:{auction_id}:{nonce}"))
+        self.auction_id, self.nonce = auction_id, nonce
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match, /):
-        return cls(int(match["id"]))
+        return cls(int(match["id"]), match["nonce"])
 
     async def callback(self, interaction: discord.Interaction):
-        auction_id = self.auction_id
-        await Pager(lambda page: items_page(auction_id, page), auction_id).send(interaction)
+        auction_id, nonce = self.auction_id, self.nonce
+        await Pager(lambda page: items_page(auction_id, nonce, page), auction_id, nonce).send(interaction)
 
 
 class BidModal(discord.ui.Modal):
     def __init__(self, auction: dict, user: discord.User):
         heading = auction.get("title") or f"Auction #{auction['id']}"
         super().__init__(title=f"Bid · {heading}"[:45], timeout=600)
-        self.auction_id = auction["id"]
+        self.auction_id, self.nonce = auction["id"], auction["nonce"]
         self.item_no = None
         default = None
         if len(auction["items"]) > 1:
@@ -831,7 +914,7 @@ class BidModal(discord.ui.Modal):
             hint = "e.g. 250 or 1.5k"
         else:
             minimum = minimum_bid(auction, auction["items"][0])
-            hint = f"At least {fmt(minimum)}"
+            hint = f"At least {money(auction, minimum)}"
             default = str(minimum)  # pre-filled with the lowest allowed bid; just edit it
         self.bid = discord.ui.TextInput(label="Your bid", placeholder=hint, default=default, max_length=20)
         self.alias = discord.ui.TextInput(label="Custom name (optional)", placeholder=clean(user.display_name, 32), required=False, max_length=32)
@@ -839,7 +922,7 @@ class BidModal(discord.ui.Modal):
         self.add_item(self.alias)
 
     async def on_submit(self, interaction: discord.Interaction):
-        auction = bot.store.auctions.get(self.auction_id)
+        auction = running(self.auction_id, self.nonce)
         if not auction:
             return await reject(interaction, "That auction has ended.")
         index = 0
@@ -862,41 +945,58 @@ class BidModal(discord.ui.Modal):
 
 @bot.tree.command(name="create_auction", description="Start an auction with one or more items")
 @app_commands.guild_only()
-@app_commands.describe(items="Comma-separated item names, e.g. Golden Duck, Cursed Spoon, Mystery Box", duration_text="For example 30m, 2h, or 1d", title="Optional title", starting_bid="Opening bid", min_increment="Minimum raise", anti_snipe="Extend bidding when a late bid arrives")
-async def create_auction(interaction: discord.Interaction, items: str, duration_text: str, title: Optional[str] = None, starting_bid: app_commands.Range[int, 0, MAX_BID] = 0, min_increment: app_commands.Range[int, 1, MAX_BID] = 1, anti_snipe: bool = False):
+@app_commands.describe(
+    items="Comma-separated item names, e.g. Golden Duck, Cursed Spoon, Mystery Box",
+    duration_text="For example 30m, 2h, or 1d",
+    title="Optional title",
+    starting_bids="Opening bid per item, in item order, e.g. 50, 100, 25 (one number applies to all)",
+    min_increment="Minimum raise",
+    currency="Currency name, e.g. $, 🪙 or gold (optional)",
+    anti_snipe="Extend bidding when a late bid arrives",
+)
+async def create_auction(interaction: discord.Interaction, items: str, duration_text: str, title: Optional[str] = None, starting_bids: Optional[str] = None, min_increment: app_commands.Range[int, 1, MAX_BID] = 1, currency: Optional[app_commands.Range[str, 1, MAX_CURRENCY]] = None, anti_snipe: bool = False):
     names = [clean(part, 50) for part in items.split(",") if clean(part, 50)]
     seconds = duration(duration_text)
     if not names or len({n.lower() for n in names}) != len(names):
         return await reject(interaction, "Provide at least one uniquely named item (comma-separated).")
     if seconds is None:
         return await reject(interaction, "Duration must be between 10 seconds and 14 days (e.g. 30m, 2h, 1d).")
+    starts, problem = starting_bids_for(starting_bids, len(names))
+    if problem:
+        return await reject(interaction, problem)
     now = time.time()
-    aid = bot.store.next_id
-    auction = {
-        "id": aid,
-        "guild_id": interaction.guild_id,
-        "channel_id": interaction.channel_id,
-        "message_id": 0,
-        "creator_id": interaction.user.id,
-        "creator_name": clean(interaction.user.display_name, 32),
-        "creator_avatar": interaction.user.display_avatar.url,
-        "title": clean(title, 80) if title else None,
-        "starting_bid": starting_bid,
-        "min_increment": min_increment,
-        "anti_snipe": anti_snipe,
-        "extensions": 0,
-        "bid_count": 0,
-        "started_at": now,
-        "duration": seconds,  # the original length: the 50% / 75% DMs are measured against it
-        "notified": [],  # which of those DMs have already gone out
-        "ends_at": now + seconds,
-        "items": [{"name": n, "bid": 0, "bidder_id": None, "bidder_name": None, "bidders": {}} for n in names],
-    }
-    bot.store.next_id += 1  # claimed before any await, so two commands can't share an id
-    await interaction.response.send_message(embed=auction_embed(auction), view=bid_view(auction))
-    auction["message_id"] = (await interaction.original_response()).id
-    bot.store.auctions[aid] = auction
-    bot.store.save()
+    aid = bot.store.reserve_id()  # the lowest free number, held until the post is up
+    try:
+        auction = {
+            "id": aid,
+            "nonce": secrets.token_hex(4),  # tells this auction's buttons apart from an older one with the same number
+            "guild_id": interaction.guild_id,
+            "channel_id": interaction.channel_id,
+            "message_id": 0,
+            "creator_id": interaction.user.id,
+            "creator_name": clean(interaction.user.display_name, 32),
+            "creator_avatar": interaction.user.display_avatar.url,
+            "title": clean(title, 80) if title else None,
+            "currency": clean_currency(currency) if currency else DEFAULT_CURRENCY,
+            "min_increment": min_increment,
+            "anti_snipe": anti_snipe,
+            "extensions": 0,
+            "bid_count": 0,
+            "started_at": now,
+            "duration": seconds,  # the original length: the 50% / 75% DMs are measured against it
+            "notified": [],  # which of those DMs have already gone out
+            "ends_at": now + seconds,
+            "items": [
+                {"name": n, "start": s, "bid": 0, "bidder_id": None, "bidder_name": None, "bidders": {}}
+                for n, s in zip(names, starts)
+            ],
+        }
+        await interaction.response.send_message(embed=auction_embed(auction), view=bid_view(auction))
+        auction["message_id"] = (await interaction.original_response()).id
+        bot.store.auctions[aid] = auction
+        bot.store.save()
+    finally:
+        bot.store.reserved.discard(aid)
 
 
 @bot.tree.command(name="bid", description="Bid on an auction item")
@@ -925,7 +1025,7 @@ async def bid_autocomplete(interaction: discord.Interaction, current: str):
         if auction["guild_id"] != interaction.guild_id or auction["ends_at"] <= now:
             continue
         for i, item in enumerate(auction["items"]):
-            price = "no bids" if item["bidder_id"] is None else fmt(item["bid"])
+            price = "no bids" if item["bidder_id"] is None else money(auction, item["bid"])
             text = f"{tag(auction)[:28]} · {item['name'][:40]} ({price})"[:100]
             if current.lower() in text.lower():
                 here = auction["channel_id"] != interaction.channel_id  # this channel's items first
@@ -966,8 +1066,8 @@ async def mybids(interaction: discord.Interaction):
                 status = "**Winning**"
             else:
                 outbid += 1
-                status = f"Outbid, now **{fmt(item['bid'])}**"
-            rows.append(f"**{n}.** {safe(item['name'])} · your best **{fmt(best)}** · {status}")
+                status = f"Outbid, now **{money(auction, item['bid'])}**"
+            rows.append(f"**{n}.** {safe(item['name'])} · your best **{money(auction, best)}** · {status}")
         if rows:
             groups.append((f"{label(auction)} · ends <t:{int(auction['ends_at'])}:R> · [View]({jump_url(auction)})", rows))
     if not groups:
@@ -1004,6 +1104,22 @@ async def cancel_auction(interaction: discord.Interaction, auction_id: int):
         await bot.close_auction(auction_id, cancelled=True)
 
 
+@bot.tree.command(name="set_currency", description="Rename the currency on your running auction")
+@app_commands.guild_only()
+@app_commands.describe(auction_id="The auction number (see /auctions)", currency="New currency name, e.g. $, 🪙 or gold. Type none to remove it")
+async def set_currency(interaction: discord.Interaction, auction_id: int, currency: app_commands.Range[str, 1, MAX_CURRENCY]):
+    auction = await manageable(interaction, auction_id)
+    if not auction:
+        return
+    auction["currency"] = None if currency.strip().lower() == "none" else clean_currency(currency)
+    bot.store.save()
+    bot.dirty.add(auction_id)  # the post redraws with the new name within a couple of seconds
+    if auction["currency"]:
+        await reply(interaction, f"Prices in {label(auction)} now use **{auction['currency']}**.", "ok", "Currency updated")
+    else:
+        await reply(interaction, f"Prices in {label(auction)} now show as plain numbers.", "ok", "Currency removed")
+
+
 @bot.tree.command(name="auction_help", description="Show auction bot help")
 async def auction_help(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1015,8 +1131,9 @@ async def auction_help(interaction: discord.Interaction):
         name="Start one",
         value=(
             "`/create_auction items:Golden Duck, Cursed Spoon duration_text:2h`\n"
-            "List as many items as you like. Optional extras: a title, an opening bid, a minimum "
-            "raise, and anti-snipe (late bids push the end back)."
+            "List as many items as you like, and give each its own opening bid with "
+            "`starting_bids:50, 100, 25`. Optional extras: a title, a minimum raise, a currency "
+            "name like `gold` or `$`, and anti-snipe (late bids push the end back)."
         ),
         inline=False,
     )
@@ -1053,7 +1170,7 @@ async def auction_help(interaction: discord.Interaction):
     )
     embed.add_field(
         name="Hosts",
-        value="`/end_auction` closes one early. `/cancel_auction` calls it off.",
+        value="`/end_auction` closes one early. `/cancel_auction` calls it off. `/set_currency` renames the currency.",
         inline=False,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
