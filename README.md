@@ -1,46 +1,33 @@
-# Auction Bot
+# Discord Mock Auction Bot
 
-A Discord auction bot using Python 3.10+ and discord.py 2.4+. Auction state is stored as JSON and can be preserved by mounting a volume when deploying.
-
-## Run locally
-
-1. Create a Discord application and bot at <https://discord.com/developers/applications>.
-2. Invite it with the `bot` and `applications.commands` scopes. Grant View Channels, Send Messages, Send Messages in Threads, and Embed Links.
-3. Copy `.env.example` to `.env`, set `DISCORD_TOKEN` to a **newly generated** bot token, then install and run:
-
-   ```sh
-   python -m pip install -r requirements.txt
-   python auction_bot.py
-   ```
-
-Set `GUILD_ID` while testing to sync slash commands immediately to one test server; omit it for global sync. Never commit `.env` or paste a bot token into GitHub.
-
-## Docker hosting
-
-Build and run with a persistent data volume and pass the token as a runtime secret/environment variable:
-
-```sh
-docker build -t auction-bot .
-docker run -d --name auction-bot --restart unless-stopped \
-  -e DISCORD_TOKEN='YOUR_NEW_TOKEN' \
-  -v auction-data:/data auction-bot
-```
-
-Configure the same environment variables in your hosting provider's secret settings. Keep the `/data` volume attached so auction data survives restarts.
+A Discord bot for mock auctions. Start an auction with several items, give each its own opening bid,
+let people bid from any channel under custom names, and the bot pings the winners when time is up.
 
 ## Commands
+`/create_auction`, `/bid`, `/mybids`, `/auctions`, `/set_currency`, `/end_auction`, `/cancel_auction`, `/auction_help`
 
-- `/create_auction` — create an auction with comma-separated items and a duration such as `30m`, `2h`, or `1d`.
-- `/bid` — bid on an item; autocomplete lists active auction items. You can also use the button on an auction post.
-- `/auctions`, `/mybids`, `/auction_help` — view current auctions, your bids, and help.
-- `/end_auction` and `/cancel_auction` — host or Manage Server controls.
+Example: `/create_auction items:Golden Duck, Cursed Spoon, Mystery Box duration_text:2h starting_bids:50, 100, 25 currency:gold`
 
-The bot supports custom bidder names, minimum increments, anti-snipe extensions, JSON persistence, and winner announcements. An auction can hold any number of items; when they don't all fit on the post, a **View all items** button opens a paged list. The post refreshes as bids come in and turns orange once the auction enters its final quarter.
+## Run it locally
+1. `pip install -r requirements.txt`
+2. Copy `.env.example` to `.env` and put your bot token in it.
+3. `python auction_bot.py`
 
-## Direct messages
+## Settings (environment variables)
+| Variable | Purpose |
+| --- | --- |
+| `DISCORD_TOKEN` | Your bot token (required, never commit it) |
+| `GUILD_ID` | Optional: your server ID, for instant slash-command updates |
+| `DEFAULT_CURRENCY` | Optional: currency name used when an auction doesn't set one |
+| `KEEP_AUCTIONS` | Optional: `1` saves running auctions and resumes them after a restart. Off by default |
+| `AUCTION_DATA_FILE` | Only used when `KEEP_AUCTIONS=1`. Defaults to `/data/auctions.json` in Docker |
+| `LOG_LEVEL` | Optional: `INFO` (default) or `DEBUG` |
 
-The bot sends these DMs on a best-effort basis. Anyone who has turned off DMs from server members simply won't receive them, and nothing else is affected.
+## Hosting notes
+The repo includes a `Dockerfile`, so any host that runs Docker or deploys from GitHub can run it.
 
-- **Outbid:** when someone beats your bid you get the item, the new top bid, and the minimum needed to retake the lead. It never says who outbid you.
-- **Raised:** when you raise your own top bid you get the previous and new amounts.
-- **Time checks:** everyone who has bid gets a DM when 50% and again when 75% of an auction's running time has passed (a 100-minute auction sends them at 50 and 25 minutes left), showing where their bids stand. These marks are measured against the auction's original length, so anti-snipe extensions don't move them. Auctions that were already running before this feature was added don't send them.
+By default nothing is carried over between runs: if the bot restarts or is redeployed, any auction that
+was running just disappears without results, so avoid redeploying mid-auction. If you would rather resume
+auctions after a restart, set `KEEP_AUCTIONS=1` and mount a persistent volume at `/data`.
+
+Run only one copy of the bot per token. Two copies will both answer every command.
