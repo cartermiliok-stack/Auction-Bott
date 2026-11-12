@@ -1,0 +1,11 @@
+# Secrets and local data: never commit these
+.env
+auctions.json
+auctions.tmp
+auctions.json.corrupt-*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
